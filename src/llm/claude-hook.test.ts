@@ -11,6 +11,10 @@ import { DEFAULT_CONFIG, type Config } from "../config.js";
 import { tempHome } from "../test-home.js";
 import type { UsageSnapshot } from "./usage/index.js";
 
+// Tests that omit `home` would otherwise open the developer's real
+// ~/.local/share/llm-budget store (an active override there flips results).
+process.env.HOME = tempHome("llm-budget-claude-hook-home-");
+
 function baseConfig(overrides: { fiveHourBlockAtPercent?: number } = {}): Config {
   const config = structuredClone(DEFAULT_CONFIG);
   if (overrides.fiveHourBlockAtPercent !== undefined) {

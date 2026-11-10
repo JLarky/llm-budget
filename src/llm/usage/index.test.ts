@@ -119,3 +119,49 @@ test("fetchDirectUsage forceRefresh bypasses a fresh cache", async () => {
   });
   assert.equal(snapshot.providers[0]?.windows[0]?.usedPct, 9);
 });
+
+test("fetchDirectUsage resolves only the requested providers, each cached separately", async () => {
+  const home = signedInHome();
+  const urls: string[] = [];
+  const fetch = async (url: RequestInfo | URL) => {
+    urls.push(String(url));
+    if (String(url).includes("anthropic")) {
+      return jsonResponse(200, { five_hour: { utilization: 1 }, seven_day: { utilization: 2 } });
+    }
+    return jsonResponse(200, { rate_limit: { primary_window: { used_percent: 3 } } });
+  };
+  const claudeOnly = await fetchDirectUsage({ home, platform: "linux", fetch, providers: ["claude"] });
+  assert.deepEqual(claudeOnly.providers.map((p) => p.providerId), ["claude"]);
+  assert.equal(urls.length, 1);
+  assert.match(urls[0] ?? "", /anthropic/);
+  // A later full fetch reuses the fresh Claude row and only hits the others.
+  await fetchDirectUsage({ home, platform: "linux", fetch });
+  assert.equal(urls.filter((u) => u.includes("anthropic")).length, 1);
+  assert.ok(urls.some((u) => u.includes("chatgpt")));
+});
+
+test("fetchDirectUsage keeps a good Claude reading through a 429 and backs off", async () => {
+  const home = signedInHome();
+  const db = openLlmDb(home);
+  let claudeCalls = 0;
+  const ok = async () => {
+    claudeCalls += 1;
+    return jsonResponse(200, { five_hour: { utilization: 30 }, seven_day: { utilization: 40 } });
+  };
+  const limited = async () => {
+    claudeCalls += 1;
+    return new Response("{}", { status: 429, headers: { "retry-after": "300" } });
+  };
+  const t0 = new Date();
+  await fetchDirectUsage({ home, db, platform: "linux", fetch: ok, providers: ["claude"], now: t0 });
+  const later = new Date(t0.getTime() + 120_000); // past the 90s TTL
+  const stale = await fetchDirectUsage({ home, db, platform: "linux", fetch: limited, providers: ["claude"], now: later });
+  const claude = stale.providers[0];
+  assert.equal(claude?.status, "available");
+  assert.equal(claude?.windows[1]?.usedPct, 40);
+  assert.match(claude?.stale?.reason ?? "", /429/);
+  assert.equal(claudeCalls, 2);
+  // Within Retry-After: served from cache again with no request.
+  await fetchDirectUsage({ home, db, platform: "linux", fetch: limited, providers: ["claude"], now: new Date(later.getTime() + 60_000) });
+  assert.equal(claudeCalls, 2);
+});

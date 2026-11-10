@@ -36,6 +36,11 @@ export interface GuardDecision {
   snapshot: UsageSnapshot;
   sessionId: string;
   now: Date;
+  /**
+   * Set when the decision rests on an older reading (refresh failed or was
+   * rate limited) — rendered in block messages so stale data is never silent.
+   */
+  usageNote?: string;
 }
 
 /**
@@ -71,12 +76,17 @@ export async function runGuard(
   const overrideRaw = getState(db, "override_until");
   const overrideUntil = overrideRaw ? new Date(overrideRaw) : null;
 
+  const agentConfig = agent === "claude" ? config.claude : config.codex;
   let snapshot: UsageSnapshot;
   let usageUnknownReason: string | null = null;
   try {
     snapshot = deps.fetchUsage
       ? await deps.fetchUsage()
-      : await fetchDirectUsage({ home: deps.home });
+      : await fetchDirectUsage({
+          home: deps.home,
+          providers: [agent],
+          maxStaleMs: { [agent]: agentConfig.maxStaleMs },
+        });
   } catch (error) {
     snapshot = ZERO_SNAPSHOT;
     const detail = error instanceof Error ? error.message : String(error);
@@ -91,10 +101,32 @@ export async function runGuard(
     usageUnknownReason = `${agent} usage ${provider.status}${detail}`;
   }
 
-  const measurements =
+  let measurements =
     provider && !usageUnknownReason ? buildMeasurements(agent, config, provider) : [];
   if (!usageUnknownReason) {
     usageUnknownReason = missingGates(agent, config, measurements);
+  }
+
+  let usageNote: string | undefined;
+  if (provider?.stale && !usageUnknownReason) {
+    usageNote = `Usage reading is ${formatAgeMs(provider.stale.ageMs)} old (refresh: ${provider.stale.reason})`;
+  }
+  // Too old to gate on, but a window it showed over threshold that has not
+  // reset since still blocks — even with failClosed off. Usage within a
+  // window only grows until it resets, so stale data can tighten, never loosen.
+  if (usageUnknownReason && provider?.lastGood) {
+    const lastGood = provider.lastGood;
+    const tripped = buildMeasurements(agent, config, { ...provider, windows: lastGood.windows }).filter(
+      (m) =>
+        m.blockAtPercent !== null &&
+        Number.isFinite(m.usedPct) &&
+        m.usedPct >= m.blockAtPercent &&
+        (!m.resetsAt || Date.parse(m.resetsAt) > now.getTime()),
+    );
+    if (tripped.length > 0) {
+      measurements = tripped;
+      usageNote = `Based on the last good usage reading from ${lastGood.fetchedAt}; current usage is unknown (${usageUnknownReason})`;
+    }
   }
 
   const evaluation = evaluateBudget({
@@ -107,7 +139,7 @@ export async function runGuard(
   });
   evaluation.displayMeasurements = measurements;
 
-  return {
+  const decision: GuardDecision = {
     allow: evaluation.allow,
     evaluation,
     config,
@@ -115,6 +147,14 @@ export async function runGuard(
     sessionId: deps.sessionId ?? "",
     now,
   };
+  if (usageNote) decision.usageNote = usageNote;
+  return decision;
+}
+
+function formatAgeMs(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.round(s / 60)}m`;
 }
 
 /**
@@ -224,7 +264,7 @@ const TOOL_LABELS = {
 
 /** Render the user-facing deny message (session id + escape hatches). */
 export function formatGuardDeny(
-  decision: Pick<GuardDecision, "evaluation" | "now">,
+  decision: Pick<GuardDecision, "evaluation" | "now" | "usageNote">,
   agent: GuardAgent,
   sessionId?: string,
 ): string {
@@ -259,6 +299,10 @@ export function formatGuardDeny(
         if (m.resetsAt) lines.push(`  Resets: ${m.resetsAt}${formatResetCountdown(m.resetsAt, now)}`);
       }
     }
+    lines.push("");
+  }
+  if (decision.usageNote) {
+    lines.push(`Note: ${decision.usageNote}`);
     lines.push("");
   }
 

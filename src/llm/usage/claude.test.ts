@@ -111,3 +111,20 @@ test("fetchClaudeUsage does not refresh Keychain-backed tokens", async () => {
   assert.match(usage.error ?? "", /expired/);
   assert.equal(tokenCalls, 0);
 });
+
+test("fetchClaudeUsage flags HTTP 429 with the vendor's Retry-After", async () => {
+  const home = homeWithClaudeCreds();
+  const usage = await fetchClaudeUsage({
+    home,
+    platform: "linux",
+    fetch: async () =>
+      new Response(JSON.stringify({ error: { type: "rate_limit_error" } }), {
+        status: 429,
+        headers: { "retry-after": "42" },
+      }),
+  });
+  assert.equal(usage.status, "error");
+  assert.equal(usage.rateLimited, true);
+  assert.equal(usage.retryAfterMs, 42_000);
+  assert.match(usage.error ?? "", /HTTP 429/);
+});

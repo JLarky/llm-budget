@@ -5,6 +5,10 @@ import { formatGuardDeny, runGuard } from "./guard.js";
 import type { UsageSnapshot } from "./usage/index.js";
 import { tempHome } from "../test-home.js";
 
+// Tests that omit `home` would otherwise open the developer's real
+// ~/.local/share/llm-budget store (an active override there flips results).
+process.env.HOME = tempHome("llm-budget-guard-home-");
+
 function config(overrides: {
   claudeEnabled?: boolean;
   codexEnabled?: boolean;
@@ -373,4 +377,65 @@ test("claude weekly window uses the vendor's own window id", async () => {
 
   const allowed = await runGuard("claude", config({}), { fetchUsage: CLAUDE_SNAPSHOT });
   assert.equal(allowed.allow, true);
+});
+
+test("a stale reading still gates and the deny message says how old it is", async () => {
+  const stale = (): UsageSnapshot => {
+    const s = snapshot([
+      { providerId: "claude", windows: [{ id: "weekly", label: "Weekly", usedPct: 85 }, { id: "five_hour", label: "Session", usedPct: 5 }] },
+    ]);
+    const p = s.providers[0];
+    if (p) p.stale = { ageMs: 240_000, reason: "Claude usage API HTTP 429 (rate limited)" };
+    return s;
+  };
+  const decision = await runGuard("claude", config({}), { fetchUsage: stale });
+  assert.equal(decision.allow, false);
+  assert.equal(decision.evaluation.reasons[0]?.kind, "window");
+  const message = formatGuardDeny(decision, "claude", "s1");
+  assert.match(message, /Note: Usage reading is 4m old \(refresh: Claude usage API HTTP 429/);
+});
+
+function tooStale(weeklyPct: number, resetsAt: string | null): () => UsageSnapshot {
+  return () => {
+    const s = snapshot([
+      { providerId: "claude", status: "error", error: "HTTP 429; last good usage is 30m old (max 10m)" },
+    ]);
+    const p = s.providers[0];
+    if (p) {
+      p.lastGood = {
+        fetchedAt: "2026-08-24T23:30:00.000Z",
+        windows: [
+          { id: "weekly", label: "Weekly", usedPct: weeklyPct, resetsAt },
+          { id: "five_hour", label: "Session", usedPct: 1, resetsAt: null },
+        ],
+      };
+    }
+    return s;
+  };
+}
+
+test("too-stale data over threshold still blocks even with failClosed off", async () => {
+  const now = new Date("2026-08-25T00:00:00.000Z");
+  const decision = await runGuard("claude", config({ failClosed: false }), {
+    now,
+    fetchUsage: tooStale(95, "2026-08-31T00:00:00.000Z"),
+  });
+  assert.equal(decision.allow, false);
+  assert.equal(decision.evaluation.reasons[0]?.kind, "window");
+  assert.match(formatGuardDeny(decision, "claude"), /last good usage reading .* current usage is unknown/);
+});
+
+test("too-stale data never loosens: under threshold is unknown usage (failClosed decides)", async () => {
+  const now = new Date("2026-08-25T00:00:00.000Z");
+  const closed = await runGuard("claude", config({}), { now, fetchUsage: tooStale(10, null) });
+  assert.equal(closed.allow, false);
+  assert.equal(closed.evaluation.reasons[0]?.kind, "usageUnknown");
+  const open = await runGuard("claude", config({ failClosed: false }), { now, fetchUsage: tooStale(10, null) });
+  assert.equal(open.allow, true);
+  // A tripped window that has since reset is no longer evidence of anything.
+  const reset = await runGuard("claude", config({ failClosed: false }), {
+    now,
+    fetchUsage: tooStale(95, "2026-08-24T23:45:00.000Z"),
+  });
+  assert.equal(reset.allow, true);
 });
