@@ -28,6 +28,12 @@ export interface ClaudeConfig {
     /** Anthropic's rolling 5-hour session cap. */
     five_hour: WindowConfig;
   };
+  /**
+   * When a refresh fails (HTTP 429, outage, waiting on another process), the
+   * last good reading is gated on until it is this old (ms); beyond it usage
+   * counts as unknown and failClosed decides.
+   */
+  maxStaleMs: number;
 }
 
 export interface CodexConfig {
@@ -41,6 +47,8 @@ export interface CodexConfig {
      */
     session: WindowConfig;
   };
+  /** Same as {@link ClaudeConfig.maxStaleMs}, for the OpenAI usage reading. */
+  maxStaleMs: number;
 }
 
 export interface CursorConfig {
@@ -102,6 +110,7 @@ export const DEFAULT_CONFIG: Config = {
       weekly: { blockAtPercent: 80 },
       five_hour: { blockAtPercent: 80 },
     },
+    maxStaleMs: 600_000,
   },
   codex: {
     enabled: true,
@@ -109,6 +118,7 @@ export const DEFAULT_CONFIG: Config = {
       weekly: { blockAtPercent: 80 },
       session: { blockAtPercent: null },
     },
+    maxStaleMs: 600_000,
   },
   cursor: {
     enabled: true,
@@ -171,6 +181,7 @@ export function parseConfig(raw: JsonValue | Config): Config {
           DEFAULT_CONFIG.claude.windows.five_hour,
         ),
       },
+      maxStaleMs: parsed.claude?.maxStaleMs ?? DEFAULT_CONFIG.claude.maxStaleMs,
     },
     codex: {
       enabled: parsed.codex?.enabled ?? DEFAULT_CONFIG.codex.enabled,
@@ -178,6 +189,7 @@ export function parseConfig(raw: JsonValue | Config): Config {
         weekly: resolveWindow(parsed.codex?.windows?.weekly, DEFAULT_CONFIG.codex.windows.weekly),
         session: resolveWindow(parsed.codex?.windows?.session, DEFAULT_CONFIG.codex.windows.session),
       },
+      maxStaleMs: parsed.codex?.maxStaleMs ?? DEFAULT_CONFIG.codex.maxStaleMs,
     },
     cursor: {
       enabled: parsed.cursor?.enabled ?? DEFAULT_CONFIG.cursor.enabled,
@@ -258,7 +270,10 @@ export function renderConfigFile(c: Config): string {
     "windows": {
       "weekly": { "blockAtPercent": ${blockAt(c.claude.windows.weekly)} },
       "five_hour": { "blockAtPercent": ${blockAt(c.claude.windows.five_hour)} }
-    }
+    },
+    // If a usage refresh fails (e.g. HTTP 429), keep gating on the last good
+    // reading until it is this old (ms); after that usage is unknown.
+    "maxStaleMs": ${c.claude.maxStaleMs}
   },
   "codex": {
     // Gate Codex CLI sessions at all?
@@ -266,7 +281,9 @@ export function renderConfigFile(c: Config): string {
     "windows": {
       "weekly": { "blockAtPercent": ${blockAt(c.codex.windows.weekly)} },
       "session": { "blockAtPercent": ${blockAt(c.codex.windows.session)} }
-    }
+    },
+    // Same as claude.maxStaleMs, for the OpenAI usage reading.
+    "maxStaleMs": ${c.codex.maxStaleMs}
   },
   "cursor": {
     // Gate Cursor Agent sessions at all?

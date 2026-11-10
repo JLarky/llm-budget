@@ -22,6 +22,7 @@ export const ClaudeSchema = v.strictObject({
       five_hour: v.optional(WindowSchema),
     }),
   ),
+  maxStaleMs: v.optional(nonNegativeFinite),
 });
 
 export const CodexSchema = v.strictObject({
@@ -32,6 +33,7 @@ export const CodexSchema = v.strictObject({
       session: v.optional(WindowSchema),
     }),
   ),
+  maxStaleMs: v.optional(nonNegativeFinite),
 });
 
 export const CursorSchema = v.strictObject({

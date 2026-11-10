@@ -8,6 +8,11 @@ import {
   CodexHookInputError,
 } from "./codex-hook.js";
 import type { UsageSnapshot } from "./usage/index.js";
+import { tempHome } from "../test-home.js";
+
+// Tests that omit `home` would otherwise open the developer's real
+// ~/.local/share/llm-budget store (an active override there flips results).
+process.env.HOME = tempHome("llm-budget-codex-hook-home-");
 
 function config(): Config {
   return structuredClone(DEFAULT_CONFIG);

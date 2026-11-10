@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { jsonString, parseJsonText, type JsonValue } from "../../json-value.js";
 import { asRecord, fetchJson, finiteNumber, type FetchFn } from "./http.js";
-import { errored, unavailable, type ProviderUsage, type UsageWindow } from "./types.js";
+import {
+  errored,
+  httpError,
+  unavailable,
+  type CallError,
+  type ProviderUsage,
+  type UsageWindow,
+} from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -125,7 +132,7 @@ function windowsFromUsage(json: JsonValue | null | undefined): UsageWindow[] {
 async function callUsage(
   token: string,
   options: ClaudeFetchOptions,
-): Promise<{ kind: "ok"; json: JsonValue } | { kind: "auth" } | { kind: "error"; detail: string }> {
+): Promise<{ kind: "ok"; json: JsonValue } | { kind: "auth" } | CallError> {
   try {
     const res = await fetchJson(
       USAGE_URL,
@@ -140,7 +147,7 @@ async function callUsage(
     );
     if (res.status === 401 || res.status === 403) return { kind: "auth" };
     if (res.status < 200 || res.status >= 300) {
-      return { kind: "error", detail: `Claude usage API HTTP ${res.status}` };
+      return httpError("Claude usage API", res);
     }
     if (res.json == null) return { kind: "error", detail: "Claude usage API returned non-JSON" };
     return { kind: "ok", json: res.json };
@@ -233,7 +240,7 @@ export async function fetchClaudeUsage(options: ClaudeFetchOptions = {}): Promis
     return unavailable("claude", "Claude Code", "Claude OAuth token expired");
   }
   if (result.kind === "error") {
-    return errored("claude", "Claude Code", result.detail);
+    return errored("claude", "Claude Code", result.detail, result);
   }
 
   const windows = windowsFromUsage(result.json);

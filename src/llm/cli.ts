@@ -354,6 +354,14 @@ interface ProviderResult {
   error: string | null;
 }
 
+/** Never let a stale reading pass as live in status. */
+function pushStaleLine(lines: string[], provider: ProviderUsage): void {
+  if (!provider.stale) return;
+  const minutes = Math.max(0, Math.round(provider.stale.ageMs / 60_000));
+  const age = minutes < 1 ? `${Math.round(provider.stale.ageMs / 1000)}s` : `${minutes}m`;
+  lines.push(`  Stale: showing the reading from ${age} ago — ${provider.stale.reason}`);
+}
+
 function buildAgentSection(
   agent: "claude" | "codex",
   config: Config,
@@ -394,6 +402,7 @@ function buildAgentSection(
     for (const m of buildMeasurements(agent, config, provider)) {
       pushWindowLines(lines, m, now);
     }
+    pushStaleLine(lines, provider);
   }
 
   // Escape hatches for this store (Claude Code and Codex share it).
@@ -428,6 +437,7 @@ function buildCopilotSection(now: Date, result: ProviderResult): string {
         pushWindowLines(lines, m, now);
       }
     }
+    pushStaleLine(lines, copilot);
   }
   return lines.join("\n");
 }
@@ -492,6 +502,7 @@ async function statusCommand(home = homedir()): Promise<void> {
   const copilotLatch = createLatch<ProviderResult>();
   fetchDirectUsage({
     home,
+    maxStaleMs: { claude: config.claude.maxStaleMs, codex: config.codex.maxStaleMs },
     onProvider: (usage) => {
       const result = { usage, error: null };
       if (usage.providerId === "claude") claudeLatch.resolve(result);

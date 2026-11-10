@@ -3,7 +3,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { asJsonObject, jsonString, parseJsonText, type JsonValue } from "../../json-value.js";
 import { asRecord, fetchJson, finiteNumber, type FetchFn } from "./http.js";
-import { errored, unavailable, type ProviderUsage, type UsageWindow } from "./types.js";
+import {
+  errored,
+  httpError,
+  unavailable,
+  type CallError,
+  type ProviderUsage,
+  type UsageWindow,
+} from "./types.js";
 
 const USER_URL = "https://api.github.com/copilot_internal/user";
 const EDITOR_VERSION = "Vim/9.0.0";
@@ -148,7 +155,7 @@ function windowsFromUser(
 async function callUser(
   token: string,
   options: CopilotFetchOptions,
-): Promise<{ kind: "ok"; json: JsonValue } | { kind: "auth" } | { kind: "error"; detail: string }> {
+): Promise<{ kind: "ok"; json: JsonValue } | { kind: "auth" } | CallError> {
   try {
     const res = await fetchJson(
       USER_URL,
@@ -164,7 +171,7 @@ async function callUser(
     );
     if (res.status === 401 || res.status === 403) return { kind: "auth" };
     if (res.status < 200 || res.status >= 300) {
-      return { kind: "error", detail: `Copilot user API HTTP ${res.status}` };
+      return httpError("Copilot user API", res);
     }
     if (res.json == null) return { kind: "error", detail: "Copilot user API returned non-JSON" };
     return { kind: "ok", json: res.json };
@@ -191,7 +198,7 @@ export async function fetchCopilotUsage(options: CopilotFetchOptions = {}): Prom
     return unavailable("copilot", "GitHub Copilot", "GitHub Copilot OAuth token expired");
   }
   if (result.kind === "error") {
-    return errored("copilot", "GitHub Copilot", result.detail);
+    return errored("copilot", "GitHub Copilot", result.detail, result);
   }
 
   const mapped = windowsFromUser(result.json);

@@ -67,6 +67,37 @@ install.
 `Stop` is deliberately not hooked: it fires after the response is already
 billed, and blocking it would only make Claude keep working.
 
+### Usage cache, rate limits, and stale readings (Claude Code / Codex)
+
+One turn can fire several hooks at once (`UserPromptSubmit` plus parallel
+`PreToolUse`), across several sessions, and each one is a separate process.
+If they all called the vendor every time, the Anthropic usage API would
+answer HTTP 429. So the readings are shared through the local SQLite store:
+
+- **Per-provider cache.** Claude, Codex and Copilot are cached and refreshed
+  separately. A guard only asks for its own provider. A reading counts as
+  fresh for 90s.
+- **One refresh at a time.** When a reading expires, exactly one process
+  takes a SQLite lease and calls the vendor. Every other hook **waits for that
+  refresh's result**, whether it succeeded or failed, for up to 20s. It does
+  not fire its own request. If the lease-holding process dies, the next hook
+  takes over at once. A live lease expires after 30s.
+- **Backoff.** HTTP 429 honours `Retry-After`, clamped to 5s–15min; without
+  the header it waits 60s and doubles each time. Other failures (5xx, network)
+  back off from 5s, doubling up to 2min. Nothing hits the API again until the
+  backoff ends, not even `status`.
+- **Stale readings are bounded and never silent.** If a refresh fails or
+  backs off, the last good reading is still gated on, but only until it is
+  `maxStaleMs` old (default 10 min). `status` shows a `Stale:` line and block
+  messages print the reading's age and why. Past `maxStaleMs` usage counts as
+  unknown, so `failClosed` decides. The exception: a window that last showed
+  over threshold and has not reset yet still blocks, even with
+  `failClosed: false`. Old data can only tighten a gate, never loosen it.
+
+Worst case, a hook spends about 40s waiting plus refreshing. That is under
+Claude Code's historical 60s default hook timeout; Codex defaults to 600s.
+llm-budget installs its hooks without an explicit `timeout`.
+
 ### Codex
 
 Codex enforcement uses native hooks:
@@ -193,14 +224,16 @@ with a visible error, not silently replaced with defaults.
     "windows": {
       "weekly": { "blockAtPercent": 80 },
       "five_hour": { "blockAtPercent": 80 }
-    }
+    },
+    "maxStaleMs": 600000
   },
   "codex": {
     "enabled": true,
     "windows": {
       "weekly": { "blockAtPercent": 80 },
       "session": { "blockAtPercent": null }
-    }
+    },
+    "maxStaleMs": 600000
   },
   "cursor": {
     "enabled": true,

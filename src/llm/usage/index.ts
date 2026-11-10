@@ -1,11 +1,19 @@
-import { asJsonArray, jsonString, parseJsonText, type JsonValue } from "../../json-value.js";
-import { getState, openLlmDb, setState, type DatabaseSync } from "../db.js";
+import { getState, openLlmDb, type DatabaseSync } from "../db.js";
+import {
+  DEFAULT_CACHE_TTL_MS,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_MAX_STALE_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_WAIT_TIMEOUT_MS,
+  getProviderUsageCached,
+  writeCachedProvider,
+  type CachePolicy,
+} from "./cache.js";
 import { fetchClaudeUsage } from "./claude.js";
 import { fetchCodexUsage } from "./codex.js";
 import { fetchCopilotUsage } from "./copilot.js";
 import type { FetchFn } from "./http.js";
-import { asRecord, finiteNumber } from "./http.js";
-import type { ProviderUsage, UsageSnapshot, UsageWindow } from "./types.js";
+import type { ProviderUsage, UsageSnapshot } from "./types.js";
 
 export type {
   ProviderUsage,
@@ -18,13 +26,29 @@ export { fetchClaudeUsage } from "./claude.js";
 export { fetchCodexUsage } from "./codex.js";
 export { fetchCopilotUsage } from "./copilot.js";
 
-/** Soft TTL before a hook process hits Anthropic / OpenAI again. */
-export const DEFAULT_CACHE_TTL_MS = 90_000;
+export {
+  DEFAULT_CACHE_TTL_MS,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_MAX_STALE_MS,
+  DEFAULT_WAIT_TIMEOUT_MS,
+} from "./cache.js";
 
-const CACHE_KEY = "provider_usage_v1";
+/** Pre-per-provider snapshot blob; superseded by the provider_usage_cache table. */
+const LEGACY_CACHE_KEY = "provider_usage_v1";
+
+export type UsageProviderId = "claude" | "codex" | "copilot";
+
+const ALL_PROVIDERS: readonly UsageProviderId[] = ["claude", "codex", "copilot"];
+
+const DISPLAY_NAMES = {
+  claude: "Claude Code",
+  codex: "Codex",
+  copilot: "GitHub Copilot",
+} satisfies Record<UsageProviderId, string>;
 
 export interface FetchDirectUsageOptions {
   home?: string;
+  /** Wall-clock base for cache timestamps; time still advances from it while waiting. */
   now?: Date;
   fetch?: FetchFn;
   timeoutMs?: number;
@@ -35,63 +59,41 @@ export interface FetchDirectUsageOptions {
   codexHome?: string;
   copilotHome?: string;
   platform?: NodeJS.Platform;
+  /** Which providers to resolve (default: all). Guards ask only for their own. */
+  providers?: readonly UsageProviderId[];
+  /** Per-provider max age of a good reading served when refresh fails. */
+  maxStaleMs?: Partial<Record<UsageProviderId, number>>;
+  /** Bound on waiting for another process's refresh. */
+  waitTimeoutMs?: number;
+  leaseTtlMs?: number;
+  pollIntervalMs?: number;
+  /** Test seam: monotonic-enough ms clock. Defaults to `now` advancing in real time. */
+  clock?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   /** Called as soon as each provider's usage is known, ahead of the combined return. */
   onProvider?: (usage: ProviderUsage) => void;
 }
 
-function windowFromJson(value: JsonValue): UsageWindow {
-  const rec = asRecord(value);
+function fetcherFor(id: UsageProviderId, options: FetchDirectUsageOptions): () => Promise<ProviderUsage> {
+  if (id === "claude") return () => fetchClaudeUsage(options);
+  if (id === "codex") return () => fetchCodexUsage(options);
+  return () => fetchCopilotUsage(options);
+}
+
+function policyFor(id: UsageProviderId, options: FetchDirectUsageOptions): CachePolicy {
+  const base = options.now?.getTime();
+  const start = Date.now();
+  const clock = options.clock ?? (base === undefined ? Date.now : () => base + (Date.now() - start));
   return {
-    id: jsonString(rec?.id) ?? "",
-    label: jsonString(rec?.label) ?? "",
-    usedPct: finiteNumber(rec?.usedPct),
-    resetsAt: jsonString(rec?.resetsAt),
+    ttlMs: options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS,
+    maxStaleMs: options.maxStaleMs?.[id] ?? DEFAULT_MAX_STALE_MS,
+    leaseTtlMs: options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS,
+    waitTimeoutMs: options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    pollIntervalMs: options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+    forceRefresh: options.forceRefresh ?? false,
+    clock,
+    sleep: options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
   };
-}
-
-function providerFromJson(value: JsonValue): ProviderUsage {
-  const rec = asRecord(value);
-  const status = jsonString(rec?.status);
-  return {
-    providerId: jsonString(rec?.providerId) ?? "",
-    displayName: jsonString(rec?.displayName) ?? "",
-    status:
-      status === "available" || status === "unavailable" || status === "error"
-        ? status
-        : "unavailable",
-    planLabel: jsonString(rec?.planLabel),
-    windows: (asJsonArray(rec?.windows) ?? []).map(windowFromJson),
-    error: jsonString(rec?.error),
-  };
-}
-
-function snapshotFromJson(value: JsonValue): UsageSnapshot | null {
-  const rec = asRecord(value);
-  const fetchedAt = rec ? jsonString(rec.fetchedAt) : null;
-  const providers = rec ? asJsonArray(rec.providers) : null;
-  if (fetchedAt === null || providers === null) return null;
-  return { fetchedAt, providers: providers.map(providerFromJson) };
-}
-
-function readCache(db: DatabaseSync): UsageSnapshot | null {
-  const raw = getState(db, CACHE_KEY);
-  if (!raw) return null;
-  try {
-    return snapshotFromJson(parseJsonText(raw));
-  } catch {
-    return null;
-  }
-}
-
-function writeCache(db: DatabaseSync, snapshot: UsageSnapshot): void {
-  setState(db, CACHE_KEY, JSON.stringify(snapshot));
-}
-
-function isFresh(snapshot: UsageSnapshot, now: Date, ttlMs: number): boolean {
-  const fetchedAt = new Date(snapshot.fetchedAt);
-  if (Number.isNaN(fetchedAt.getTime())) return false;
-  const age = now.getTime() - fetchedAt.getTime();
-  return age >= 0 && age < ttlMs;
 }
 
 /**
@@ -99,45 +101,52 @@ function isFresh(snapshot: UsageSnapshot, now: Date, ttlMs: number): boolean {
  *
  * Never throws for expected failures: a missing login or a down API becomes
  * an `unavailable` / `error` provider entry so the guard can fail closed.
- * Caches the snapshot in the llm-budget sqlite store (no tokens stored).
+ * Each provider is cached separately in the llm-budget sqlite store (no
+ * tokens stored) and refreshed by at most one process at a time; see
+ * `cache.ts` for the lease, backoff, and stale-fallback rules.
  */
 export async function fetchDirectUsage(
   options: FetchDirectUsageOptions = {},
 ): Promise<UsageSnapshot> {
-  const now = options.now ?? new Date();
-  const ttl = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const db = options.db ?? openLlmDb(options.home);
-  const cached = readCache(db);
-  if (cached && !options.forceRefresh && isFresh(cached, now, ttl)) {
-    for (const provider of cached.providers) options.onProvider?.(provider);
-    return cached;
-  }
-
-  const [claude, codex, copilot] = await Promise.all([
-    fetchClaudeUsage(options).then((usage) => {
+  const ids = options.providers ?? ALL_PROVIDERS;
+  dropLegacyUsageCache(db);
+  const providers = await Promise.all(
+    ids.map(async (id) => {
+      const usage = await getProviderUsageCached(
+        db,
+        id,
+        DISPLAY_NAMES[id],
+        fetcherFor(id, options),
+        policyFor(id, options),
+      );
       options.onProvider?.(usage);
       return usage;
     }),
-    fetchCodexUsage(options).then((usage) => {
-      options.onProvider?.(usage);
-      return usage;
-    }),
-    fetchCopilotUsage(options).then((usage) => {
-      options.onProvider?.(usage);
-      return usage;
-    }),
-  ]);
-  const snapshot: UsageSnapshot = {
-    fetchedAt: now.toISOString(),
-    providers: [claude, codex, copilot],
-  };
-  writeCache(db, snapshot);
-  return snapshot;
+  );
+  // Snapshot age is its oldest reading, so a cached answer keeps its timestamp.
+  const readings = providers
+    .map((p) => (p.fetchedAt ? Date.parse(p.fetchedAt) : Number.NaN))
+    .filter((t) => Number.isFinite(t));
+  const fetchedAt =
+    readings.length > 0
+      ? new Date(Math.min(...readings)).toISOString()
+      : (options.now ?? new Date()).toISOString();
+  return { fetchedAt, providers };
 }
 
 /** Test helper: persist a snapshot as if a previous fetch wrote it. */
 export function writeUsageCache(db: DatabaseSync, snapshot: UsageSnapshot): void {
-  writeCache(db, snapshot);
+  const at = Date.parse(snapshot.fetchedAt);
+  const atMs = Number.isFinite(at) ? at : Date.now();
+  for (const provider of snapshot.providers) writeCachedProvider(db, provider, atMs);
+}
+
+/** Drop the pre-per-provider single-blob cache; nothing reads it any more. */
+function dropLegacyUsageCache(db: DatabaseSync): void {
+  if (getState(db, LEGACY_CACHE_KEY) !== null) {
+    db.prepare("DELETE FROM app_state WHERE key = ?").run(LEGACY_CACHE_KEY);
+  }
 }
 
 export function isUnavailable(provider: ProviderUsage): boolean {
